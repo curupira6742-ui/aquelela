@@ -283,7 +283,12 @@ local function sendBridge(build)
             bridgeBusy = false
             return
         end
-        local _wsOk = wsEnvia(encoded, usaBin)
+        local okWs, _wsOk = pcall(wsEnvia, encoded, usaBin)
+        if not okWs then
+            bridgeBusy = false
+            bridgeBuildErr = "wsEnvia: " .. tostring(_wsOk)
+            return
+        end
         if _wsOk then
             bridgeBusy = false
             bridgeSent = (bridgeSent or 0) + 1
@@ -999,7 +1004,8 @@ local function casaNick(modelNome, raiz, camera, agora)
             Vector3.new(posR.X, posR.Y, posR.Z))
     end)
     if not okP or not res then return nil end
-    if type(res) ~= "table" or not res.X then return nil end
+    if typeof(res) ~= "Vector3" and type(res) ~= "table" then return nil end
+    if type(res) == "table" and not res.X then return nil end
     local vx, vy, vz = res.X, res.Y, res.Z
     if not vx or not vy then return nil end
     if vz and vz <= 0 then return nil end 
@@ -1786,7 +1792,7 @@ end
 local FONTE_TC = [====[
 --[[ ==========================================================================
      TEAM CHECK POR ZONA RESTRITA
-     MARCA: TC-ZONA-2026-10-23-N
+     MARCA: TC-ZONA-2026-10-23-O
      [A REGRA, NAS PALAVRAS DO DONO]
        "QUEM NASCER EM UMA ZONA RESTRITA INIMIGA VAI SER CONSIDERADO
         INIMIGO PELO RESTO DA PARTIDA."
@@ -1835,7 +1841,7 @@ local FONTE_TC = [====[
      ele confirma, nao decide.
      [READ-ONLY] Le' Workspace. Nao escreve, nao desenha, nao imprime.
      ========================================================================== ]]
-local MARCA = "TC-ZONA-2026-10-23-N"
+local MARCA = "TC-ZONA-2026-10-23-O"
 -- ==========================================================================
 --  CONFIG
 -- ==========================================================================
