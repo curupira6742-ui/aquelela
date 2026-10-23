@@ -1698,8 +1698,11 @@ end
 local function paredeVeredito(camPos, model, parts)
     if not RAYCAST_OK then return nil, nil end
     if typeof(model) ~= "Instance" then return nil, nil end
-    local alvoParte = parts and (parts.Head or parts.UpperTorso or parts.Torso
-                                 or parts.HumanoidRootPart or parts.LowerTorso)
+    local alvoParte = parts and (parts.Head or parts.head or parts.UpperTorso
+                                 or parts.Torso or parts.torso
+                                 or parts.HumanoidRootPart
+                                 or parts.humanoid_root_part
+                                 or parts.LowerTorso)
     local inst = alvoParte and (alvoParte.part or alvoParte)
     if not inst or typeof(inst) ~= "Instance" then return nil, nil end
     local okPos, destino = pcall(function() return inst.Position end)
@@ -1783,7 +1786,7 @@ end
 local FONTE_TC = [====[
 --[[ ==========================================================================
      TEAM CHECK POR ZONA RESTRITA
-     MARCA: TC-ZONA-2026-10-23-M
+     MARCA: TC-ZONA-2026-10-23-N
      [A REGRA, NAS PALAVRAS DO DONO]
        "QUEM NASCER EM UMA ZONA RESTRITA INIMIGA VAI SER CONSIDERADO
         INIMIGO PELO RESTO DA PARTIDA."
@@ -1832,7 +1835,7 @@ local FONTE_TC = [====[
      ele confirma, nao decide.
      [READ-ONLY] Le' Workspace. Nao escreve, nao desenha, nao imprime.
      ========================================================================== ]]
-local MARCA = "TC-ZONA-2026-10-23-M"
+local MARCA = "TC-ZONA-2026-10-23-N"
 -- ==========================================================================
 --  CONFIG
 -- ==========================================================================
@@ -2053,21 +2056,49 @@ local function montaCadeia(zonas, origem)
     for i = 1, #zonas do aliada[i] = false end
     if not origem then return aliada, 0 end
     aliada[origem] = true
-    local fila = { origem }
-    local cabeca = 1
     local n = 1
+    -- [MESMO PREFAB = MESMO LADO -- MEDIDO]
+    -- Dentro de uma partida o `modfile_instance_id` e constante por lado
+    -- (medido: attacker=5200 x defender=5198 na MESMA sessao; em outra
+    -- sessao virou 4696/4697 -- id de instancia de prefab). A cadeia
+    -- geometrica sozinha fundia os lados quando as caixas ficavam a
+    -- menos de `raioCadeia` (medido agora: 9 zonas em 1 particao,
+    -- 183 studs entre elas, raio 200) -- todo inimigo que tocava zona
+    -- travava ALIADO e sumia. Regra nova: zona com id IGUAL ao da ancora
+    -- e' aliada SEMPRE (distancia nao importa); zona com id DIFERENTE
+    -- nunca entra; zona SEM id segue a cadeia geometrica como antes.
+    local idO = zonas[origem].idMod
+    if idO ~= nil then
+        for i = 1, #zonas do
+            if zonas[i].idMod == idO and not aliada[i] then
+                aliada[i] = true
+                n = n + 1
+            end
+        end
+    end
+    local fila = {}
+    for i = 1, #zonas do
+        if aliada[i] then fila[#fila + 1] = i end
+    end
+    local cabeca = 1
     local r2 = TC.raioCadeia * TC.raioCadeia
     while cabeca <= #fila do
         local atual = fila[cabeca]; cabeca = cabeca + 1
         local pa = zonas[atual].pos
         for i = 1, #zonas do
             if not aliada[i] then
-                local pb = zonas[i].pos
-                local dx, dy, dz = pa[1] - pb[1], pa[2] - pb[2], pa[3] - pb[3]
-                if dx * dx + dy * dy + dz * dz <= r2 then
-                    aliada[i] = true
-                    fila[#fila + 1] = i
-                    n = n + 1
+                -- zona com idDIFERENTE do da ancora nunca e' puxada pela
+                -- geometria (e' o outro lado); sem id, vale a geometria.
+                local idI = zonas[i].idMod
+                local pode = (idI == nil) or (idO == nil) or (idI == idO)
+                if pode then
+                    local pb = zonas[i].pos
+                    local dx, dy, dz = pa[1] - pb[1], pa[2] - pb[2], pa[3] - pb[3]
+                    if dx * dx + dy * dy + dz * dz <= r2 then
+                        aliada[i] = true
+                        fila[#fila + 1] = i
+                        n = n + 1
+                    end
                 end
             end
         end
