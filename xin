@@ -413,11 +413,32 @@ local OTIM = {
     tela    = false,
     partes  = false,
     hz      = 0,
-    -- [PAREDE] Um raycast da camera ate' o alvo por pacote. O coletor e' o
-    -- UNICO lado que pode responder isto: o overlay nao tem geometria do
-    -- mapa, so' pontos de tela projetados. O resultado vai num bit do
-    -- pacote e a mira ignora quem estiver atras de parede.
-    vis     = false,
+    -- [PAREDE -- 7v7] O veredito de parede agora viaja no campo `dead` do
+    -- alvo. O campo `vis` que ia no pacote era sacrificio: o servidor
+    -- monta uma tupla de 9 campos por alvo e o 10o (vis) e descartado em
+    -- silencio -- nunca chegou ao overlay. `dead` e a rota que RESPEITA:
+    -- overlay.py:1036 faz `if dead: continue` na MIRA (escolhe_alvo) e o
+    -- ESP ignora `dead` (2514/2555) -- exatamente "so wall check no aim".
+    -- Licoes do coletor 7v7 aplicadas aqui:
+    --   tristate      -- nil = NAO medido NAO bloqueia a mira; so o
+    --                    `== false` medido marca dead (o `~= true` do 7v7
+    --                    transformava nao-medido em morto e cegava a mira)
+    --   cache         -- veredito vale wallIntervalo OU ate andar mais
+    --                    que wallQuantum studs; sem cache, 12 alvos a
+    --                    60 Hz = ~780 raycasts/s e o cliente cai (medido:
+    --                    "client cannot keep up", 1 pacote a cada 25 s)
+    --   viewmodel     -- a arma em 1a pessoa (ignore.*viewmodel*) sai do
+    --                    raio; sem isto todo veredito com arma levantada
+    --                    media o raio contra a MINHA arma
+    --   identidade    -- o alvo FICA no raio; acertou parte DELE = visivel
+    --                    (decisao por conjunto de partes lido ao vivo)
+    --   zona          -- segmento cruzando ignore/restricted = tiro
+    --                    proibido ali: mira solta, fato SEPARADO da luz
+    vis           = true,   -- ligado: o dono pediu o wall check do 7v7
+    wallViaDead   = true,   -- false devolve o comportamento antigo
+    wallIntervalo = 0.5,    -- s: TTL do veredito por alvo
+    wallQuantum   = 2.0,    -- studs: andar menos que isto nao revalida
+    wallZona      = true,   -- raio de zona de cessar-fogo ligado
 }
 
 -- Partes que bastam para a caixa quando `partes` esta' ligado: extremos do
@@ -1947,6 +1968,23 @@ local MLote = nil     -- lista {nick=,x=,y=} dos marcadores VISIVEIS agora
 local MLoteEm = 0     -- ultima leitura do lote (rate 0.5 s)
 local MCorpo = {}     -- [nomeCorpo] = {nick="...", em=os.clock()}
 local MCont = 0       -- total de casamentos (diagnose)
+-- [A REGRA DO DONO -- VERDADE NO QUADRADINHO, UMA VEZ, PARA SEMPRE]
+-- "e se aplicarmos a regra de 1 vez com o quadradinho aquele player nunca
+-- estara visivel no esp ate o final da partida"
+-- MALIADOS_NICK[nick] = true  -> ESSE JOGADOR nunca mais aparece no ESP
+--                               (sobrevive a respawn: novo corpo casa o
+--                               nick ja' travado e some no primeiro pacote)
+-- MALIADOS_CORPO[nome]= true  -> CORPO travado mesmo sem rematch (o
+--                               quadradinho escondido por fumaca/parede nao
+--                               reabre o ESP)
+-- Confirmacao em 2 pacotes seguidos (MALRUA = a sequencia por corpo): evita
+-- travar um INIMIGO que passou a 40 px do marcador de um aliado num frame
+-- ruim. Travou, nao destrava -- simetria com a regra da zona.
+local MALIADOS_NICK = {}
+local MALIADOS_CORPO = {}
+local MALRUA = {}
+local MLockN = 0      -- quantos nicks travados
+local MLockC = 0      -- quantos corpos travados
 
 local function achaMarcadores(agora)
     -- [REVALIDACAO BARATA] se a GUI morreu (rematch), o Parent some
@@ -2080,10 +2118,10 @@ local function leMarcadores(agora)
 end
 
 -- [O CASAMENTO] centro projetado da raiz do corpo x centro do quadradinho.
--- Devolve o NICK do aliado ou nil. Guarda no MCorpo com validade de 3 s.
+-- Devolve o NICK do aliado OU nil. roda TODO pacote (sem cache de leitura):
+-- a confirmacao de 2 pacotes seguidos precisa de casamentos reais, nao do
+-- eco do anterior. O MCorpo so' alimenta o DISPLAY (TTL 3 s).
 local function casaNick(modelNome, raiz, camera, agora)
-    local guardado = MCorpo[modelNome]
-    if guardado and (agora - guardado.em) < 3 then return guardado.nick end
     if not raiz or not camera then return nil end
     local lote = leMarcadores(agora)
     if not lote or #lote == 0 then return nil end
@@ -2122,6 +2160,126 @@ local function casaNick(modelNome, raiz, camera, agora)
         return melhorNick
     end
     return nil
+end
+
+-- =====================================================================
+-- [O CODINOME DOS INIMIGOS -- UM NICK DO PLACAR, PINADO POR CORPO]
+--
+-- Pedido do dono (palavras dele): "tendo acesso ao placar atribua de
+-- forma aleatoria 1 dos nicks pra um dos userid que cada esp tem e
+-- envie pro overlay" -- e o refinamento: "apenas os inimigos".
+--
+-- Os aliados NAO pegam codinome: ja' tem o nick real pelo quadradinho.
+-- Para os corpos que o quadradinho nunca confirmou (inimigos e
+-- pendentes), o nome vira um nick do PLACAR REAL do jogo (a ScreenGui
+-- {1814FF63} que lista os 15: "ANTO | K/D | PTS | COMPLEX ... SYNO ...").
+--
+-- O POOL e' filtrado: exclui MEU nome, exclui os nicks ja' TRAVADOS
+-- como aliados (MALIADOS_NICK) e exclui os codinomes ja' PINADOS em
+-- outros corpos. Sobra, na pratica, exatamente o roster do time
+-- inimigo: 6 corpos, 6 nicks, sem repetir.
+--
+-- O pin e' ESTAVEL: o mesmo corpo fica com o mesmo nick ate o fim da
+-- partida (a regra de 1 vez do dono, so' que pro codinome). Se um nick
+-- pinoado depois for confirmado como ALIADO pelo quadradinho, o pin
+-- dele e' SOLTO (na linha do MLockN no filtro) e o corpo re-pin no
+-- proximo pacote com o pool corrigido.
+-- =====================================================================
+local PlacarGui = nil       -- a ScreenGui do placar (achada pelo teste)
+local PlacarEm = 0          -- ultima leitura (rate 5 s)
+local PlacarNicks = nil     -- lista de nicks de jogador no placar
+local MPIN = {}             -- [nomeCorpo] = nick codinome (estavel)
+math.randomseed(os.time())
+
+local function lerPlacar(agora)
+    if PlacarNicks and (agora - PlacarEm) < 5 then return PlacarNicks end
+    PlacarEm = agora
+    if not Players then return nil end
+    local ok, pg = pcall(function()
+        local pl = Players.LocalPlayer
+        return pl and pl:FindFirstChild("PlayerGui") or nil
+    end)
+    if not ok or not pg then return nil end
+    -- [REVALIDACAO] a GUI pode ser recriada (rematch): se o pai sumiu,
+    -- refaz a busca inteira
+    local guiVivo = false
+    if PlacarGui then
+        pcall(function()
+            guiVivo = PlacarGui.Parent and PlacarGui.Enabled and true or false
+        end)
+    end
+    if not guiVivo then
+        -- [O TESTE] o ScreenGui com MAIS TextLabels cujo texto e' nome de
+        -- Player: os cabecalhos ("COMPLEX", "KING OF THE HILL") e colunas
+        -- ("K/D", "PTS") nao passam porque nao sao Players.
+        local melhorN, melhorSg = 0, nil
+        pcall(function()
+            for _, sg in ipairs(pg:GetChildren()) do
+                if sg:IsA("ScreenGui") and sg.Enabled then
+                    local n = 0
+                    for _, d in ipairs(sg:GetDescendants()) do
+                        if d:IsA("TextLabel") and #d.Text >= 3 and #d.Text <= 24 then
+                            if Players:FindFirstChild(tostring(d.Text)) then
+                                n = n + 1
+                            end
+                        end
+                    end
+                    if n > melhorN then
+                        melhorN = n
+                        melhorSg = sg
+                    end
+                end
+            end
+        end)
+        if melhorSg and melhorN >= 4 then
+            PlacarGui = melhorSg
+        else
+            PlacarGui = nil
+            PlacarNicks = nil
+            return nil
+        end
+    end
+    local nicks, nN = {}, 0
+    pcall(function()
+        for _, d in ipairs(PlacarGui:GetDescendants()) do
+            if d:IsA("TextLabel") and #d.Text >= 3 and #d.Text <= 24 then
+                local txt = tostring(d.Text)
+                if Players:FindFirstChild(txt) then
+                    nN = nN + 1
+                    nicks[nN] = txt
+                    if nN >= 30 then break end
+                end
+            end
+        end
+    end)
+    PlacarNicks = nicks
+    return nicks
+end
+
+local function pinInimigo(nomeCorpo, agora)
+    local pin = MPIN[nomeCorpo]
+    if pin then return pin end
+    -- [O POOL AO VIVO] placar - meu nome - aliados travados - ja' pinados
+    local meuNome = nil
+    pcall(function()
+        local pl = Players.LocalPlayer
+        if pl then meuNome = tostring(pl.Name) end
+    end)
+    local nicks = lerPlacar(agora)
+    if not nicks or #nicks == 0 then return nil end
+    local usados = {}
+    for _, nick in pairs(MPIN) do usados[nick] = true end
+    local pool, n = {}, 0
+    for _, nick in ipairs(nicks) do
+        if nick ~= meuNome and not MALIADOS_NICK[nick] and not usados[nick] then
+            n = n + 1
+            pool[n] = nick
+        end
+    end
+    if n == 0 then return nil end
+    local escolhido = pool[math.random(1, n)]
+    MPIN[nomeCorpo] = escolhido
+    return escolhido
 end
 
 local function buildTarget(v, slot, agoraPacote)
@@ -3134,59 +3292,273 @@ local function montaBinario(pkt)
 end
 
 -- =====================================================================
--- [PAREDE] UM RAYCAST POR ALVO POR PACOTE
+-- [PAREDE -- 7v7] VEREDITO DE LINHA DE VISAO, TRISTATE
 -- =====================================================================
--- A pergunta "esse alvo esta' atras de parede?" so' pode ser respondida
--- aqui: o overlay recebe pontos de tela ja' projetados e nao tem a
--- geometria do mapa. A resposta vai num bit do pacote e e' a mira que a
--- usa -- o ESP continua desenhando quem esta' coberto, porque ver pela
--- parede e' o proposito do ESP; mirar atraves dela nao e'.
+-- Responde UMA pergunta: "um raio reto da minha camera ate o osso do alvo
+-- chega la sem barrar em geometria opaca?" E so essa. Se o SERVIDOR aceita
+-- o tiro (zona, regra de time) e pergunta separada -- a zona tem raio proprio.
 --
--- Custo medido: ~0,02 ms por raycast, e roda SO' com o switch ligado
--- (OTIM.vis). Com 12 alvos em cena da' ~0,25 ms por pacote.
+-- O veredito e TRISTATE e a diferenca importa:
+--   true  -> medi e a linha esta livre
+--   false -> medi e tem geometria no caminho   (o UNICO que bloqueia a mira)
+--   nil   -> NAO medi (sem raycast, sem posicao, a API estourou)
+-- Marcar `dead` por nil foi o bug que matou a mira inteira no 7v7: um
+-- `~= true` avaliava nil como bloqueado -- 6 alvos com geometria perfeita
+-- e TODOS marcados mortos. O consumo aqui so aceita `== false`.
 --
--- O filtro exclui o proprio corpo e o modelo do alvo: sem isso o raio
--- bateria na propria cabeca do jogador local na saida, ou no peito do
--- alvo na chegada, e TODO alvo apareceria coberto.
--- Executor sem Raycast/RaycastParams existe (os antigos usam FindPartOnRay).
--- Checado UMA vez: sem isto cada alvo levantaria erro dentro do RenderStep,
--- 60x por segundo, e o coletor pararia -- o mesmo defeito que o bloco de
--- diagnostico causou antes. Com RAYCAST_OK falso o campo `vis` sai nil e a
--- mira se comporta exatamente como antes do wall-check existir.
+-- [O CACHE E O QUE IMPEDE O CLIENTE DE CAIR] Medido no 7v7 sem cache:
+-- 12 alvos x 60 Hz sao ~780 raycasts/s, o Xeno avisa "Your Roblox client
+-- cannot keep up" e o pacote cai para 1 a cada 25 s. Com cache curto o
+-- custo cai 4x: veredito vale ATE wallIntervalo (0.5 s) OU ate o ponto de
+-- vista andar mais que wallQuantum (2.0 studs) -- abaixo disso a mudanca
+-- de origem nao altera o que uma parede esconde.
+--
+-- [A CHAVE E A INSTANCIA, NAO O NOME] Nomes de corpo sao numeros
+-- RECICLADOS neste jogo: um cadaver sai e outro nasce com o mesmo nome.
+-- Veredito por nome serviria o juizo velho para um corpo novo. Chave por
+-- Model em tabela FRACA (__mode = "k"): corpo destruido, entrada morre com ele.
 local RAYCAST_OK = (typeof(Workspace.Raycast) == "function")
     and (typeof(RaycastParams) == "table" or typeof(RaycastParams) == "userdata")
 local paramsVis = nil
-local function visivelDaCamera(camPos, model, parts, meuModelo)
-    if not RAYCAST_OK then return nil end
-    -- Ponto testado: a parte mais "central" que existir. Testar a cabeca
-    -- sozinha daria falso negativo a cada vez que um batente cobre so' a
-    -- cabeca, com o corpo inteiro exposto.
+local cacheParede = setmetatable({}, { __mode = "k" })
+local nCacheParede = 0
+-- Poda bruta: estourou o teto, joga o cache TODO fora. Veredito frio custa
+-- poucos raycasts UMA vez; cache sem teto e vazamento.
+local TETO_PAREDE = 96
+local function baldeDe(v3)
+    local q = OTIM.wallQuantum
+    return math.floor(v3.X / q), math.floor(v3.Y / q), math.floor(v3.Z / q)
+end
+
+-- [O MEU CORPO PARA O FILTRO] `player.Character` e NIL neste jogo (medido
+-- duas vezes): passar ele como exclusao era passar nada, e o raio que sai
+-- da camera em 1a pessoa bate na MINHA propria cabeca na saida -- todo
+-- alvo viraria "coberto" de mentira. O meu Model e o StarterCharacter
+-- (medido: camera sempre a ~1.9 studs dele). Se o nome piscar, cai para o
+-- corpo mais perto da camera (<= 12 studs), a assinatura de "a camera
+-- esta montada neste corpo".
+local function meuModeloRaio()
+    local pasta = nil
+    pcall(function() pasta = Workspace:FindFirstChild("characters") end)
+    if not pasta then return nil end
+    local filhos = nil
+    pcall(function() filhos = pasta:GetChildren() end)
+    if not filhos then return nil end
+    for i = 1, #filhos do
+        local nm = nil
+        pcall(function() nm = filhos[i].Name end)
+        if nm == "StarterCharacter" then return filhos[i] end
+    end
+    local camI = nil
+    pcall(function() camI = Workspace.CurrentCamera end)
+    local cf = nil
+    if camI then pcall(function() cf = camI.CFrame end) end
+    if not cf then return nil end
+    local o = cf.Position
+    local melhor, dMelhor = nil, 12
+    for i = 1, #filhos do
+        local e = nil
+        pcall(function() e = filhos[i]:IsA("Model") end)
+        if e then
+            local p = nil
+            pcall(function()
+                local r = filhos[i]:FindFirstChild("humanoid_root_part")
+                    or filhos[i]:FindFirstChild("torso")
+                if r then p = r.Position end
+            end)
+            if p then
+                local d = (p - o).Magnitude
+                if d < dMelhor then melhor, dMelhor = filhos[i], d end
+            end
+        end
+    end
+    return melhor
+end
+
+-- [O VIEWMODEL -- IRMAO, NAO FILHO] A arma em primeira pessoa mora em
+-- Workspace.ignore com "viewmodel" no nome (medido no 7v7). Sem excluir
+-- ela, TODO veredito tomado com a arma levantada media o raio contra a
+-- MINHA arma: o alvo ficava "coberto" de mentira. Procurado por PADRAO,
+-- nao por nome fixo -- a arma troca. Lista recacheada a cada 1 s.
+local VIEWMODEL_AT = 0
+local VIEWMODEL_LISTA = {}
+local function viewmodels()
+    local agoraVM = os.clock()
+    if agoraVM < VIEWMODEL_AT then return VIEWMODEL_LISTA end
+    VIEWMODEL_AT = agoraVM + 1.0
+    local saida = {}
+    local ig = nil
+    pcall(function() ig = Workspace:FindFirstChild("ignore") end)
+    if ig then
+        local filhos = nil
+        pcall(function() filhos = ig:GetChildren() end)
+        if filhos then
+            for i = 1, #filhos do
+                local nm = nil
+                pcall(function() nm = filhos[i].Name end)
+                if nm and string.find(string.lower(nm), "viewmodel", 1, true) then
+                    saida[#saida + 1] = filhos[i]
+                end
+            end
+        end
+    end
+    VIEWMODEL_LISTA = saida
+    return saida
+end
+
+-- [A ZONA DE CESSAR-FOGO -- re-resolvida, nil NUNCA gravado] O latch de
+-- nil perdeu a exclusao para a SESSAO inteira no 7v7 (D1): a primeira
+-- chamada antes da replicacao de ignore/restricted e a pasta saiu do raio
+-- para sempre. Aqui um nil volta a procurar na proxima chamada.
+local ZONA_INST = nil
+local function zonaCessarFogo()
+    local ok, ainda = pcall(function() return ZONA_INST and ZONA_INST.Parent end)
+    if ok and ainda then return ZONA_INST end
+    pcall(function()
+        local ig = Workspace:FindFirstChild("ignore")
+        if ig then ZONA_INST = ig:FindFirstChild("restricted") end
+    end)
+    return ZONA_INST
+end
+
+-- [AS PARTES DO ALVO, LIDAS AO VIVO] O mapa `v.data.parts` e FOTO do
+-- momento da leitura: parte pode ter sido criada ou destruida desde entao.
+-- A identidade decide o veredito -- ela precisa ser a lista DE AGORA.
+local function partesVivas(model)
+    local saida = {}
+    local filhos = nil
+    pcall(function() filhos = model:GetChildren() end)
+    if not filhos then return saida, 0 end
+    local n = 0
+    for i = 1, #filhos do
+        local e = nil
+        pcall(function() e = filhos[i]:IsA("BasePart") end)
+        if e then
+            n = n + 1
+            saida[filhos[i]] = true
+        end
+    end
+    return saida, n
+end
+
+-- O VEREDITO. Devolve (visivel, zonaBloqueada). `visivel` pode ser nil
+-- (NAO MEDIDO). `zonaBloqueada` so vale false quando o raio de zona roda.
+local function paredeVeredito(camPos, model, parts)
+    if not RAYCAST_OK then return nil, nil end
+    if typeof(model) ~= "Instance" then return nil, nil end
+    -- O osso do alvo: a cabeca primeiro (e o osso da mira), depois torso,
+    -- depois a raiz. Testar so a cabeca daria falso negativo a cada vez
+    -- que um batente cobre so a cabeca com o corpo exposto -- por isso o
+    -- torso entra na fila antes da raiz.
     local alvoParte = parts and (parts.Head or parts.UpperTorso or parts.Torso
                                  or parts.HumanoidRootPart or parts.LowerTorso)
     local inst = alvoParte and (alvoParte.part or alvoParte)
-    if not inst or typeof(inst) ~= "Instance" then return nil end
+    if not inst or typeof(inst) ~= "Instance" then return nil, nil end
     local okPos, destino = pcall(function() return inst.Position end)
-    if not okPos or not destino then return nil end
-
-    if not paramsVis then
-        paramsVis = RaycastParams.new()
-        paramsVis.FilterType = Enum.RaycastFilterType.Exclude
-        paramsVis.IgnoreWater = true
-    end
-    local excluir = {model}
-    if meuModelo then excluir[2] = meuModelo end
-    paramsVis.FilterDescendantsInstances = excluir
+    if not okPos or not destino then return nil, nil end
 
     local origem = Vector3.new(camPos[1], camPos[2], camPos[3])
+    -- [CACHE] chave por instancia; o valor guarda o balde de origem e o relogio
+    local bx, by, bz = baldeDe(origem)
+    local agoraW = os.clock()
+    local antigo = cacheParede[model]
+    if antigo and (agoraW - antigo.quando) < OTIM.wallIntervalo
+        and antigo.bx == bx and antigo.by == by and antigo.bz == bz then
+        return antigo.visivel, antigo.zona
+    end
+
     local delta = destino - origem
     local dist = delta.Magnitude
-    -- Alvo praticamente colado na camera: nao ha' espaco para parede, e um
-    -- raio de comprimento ~0 tem direcao indefinida.
-    if dist < 0.5 then return true end
-    local ok, res = pcall(Workspace.Raycast, Workspace, origem, delta, paramsVis)
-    if not ok then return nil end
-    -- Nada no caminho = linha de visao limpa.
-    return res == nil
+    -- Colado demais para haver parede entre eu e ele: LIVRE (e nao nil --
+    -- nil aqui seria "nao medido", e um alvo grudado em mim e visivel).
+    if dist < 0.5 then return true, false end
+
+    local partesAlvo = partesVivas(model)
+    local meuM = meuModeloRaio()
+
+    -- [RAIO DE LUZ] O alvo NAO entra no filtro (licao D2 do 7v7): ele fica
+    -- no raio, e a identidade e decidida pelo RESULTADO -- se o que o raio
+    -- acertou e uma parte do PROPRIO alvo, a linha chegou nele. sair do
+    -- filtro: o meu corpo (o raio nasce dentro da minha cabeca), a arma
+    -- (viewmodel) e a zona (barreira invisivel: se ela ficasse aqui, o
+    -- veredito de LUZ mentiria -- no 7v7, 9/9 alvos "cobertos" por causa
+    -- dela). O fato "o tiro e proibido ali" e o SEGUNDO raio, la embaixo.
+    local visivel = nil
+    local okRay = pcall(function()
+        if not paramsVis then
+            paramsVis = RaycastParams.new()
+            paramsVis.FilterType = Enum.RaycastFilterType.Exclude
+            paramsVis.IgnoreWater = true
+        end
+        local f = {}
+        if meuM then f[#f + 1] = meuM end
+        local vms = viewmodels()
+        for i = 1, #vms do f[#f + 1] = vms[i] end
+        local z = zonaCessarFogo()
+        if z then f[#f + 1] = z end
+        paramsVis.FilterDescendantsInstances = f
+        local res = Workspace.Raycast(Workspace, origem, delta, paramsVis)
+        if not res then
+            visivel = true
+        else
+            local hit = nil
+            pcall(function() hit = res.Instance end)
+            if hit and partesAlvo[hit] then
+                visivel = true
+            else
+                visivel = false
+            end
+        end
+    end)
+    if not okRay then
+        -- [RESERVA] API antiga, se o Raycast estourar. FindPartOnRay aceita
+        -- UMA instancia para ignorar: vai a minha. A identidade do alvo
+        -- vale do mesmo jeito -- se as duas APIs respondessem diferente
+        -- para a MESMA cena, a reserva diria que todo alvo esta coberto.
+        local ok2 = pcall(function()
+            local r = Ray.new(origem, delta)
+            local hit = Workspace:FindPartOnRay(r, meuM, false, true)
+            if hit == nil or partesAlvo[hit] then
+                visivel = true
+            else
+                visivel = false
+            end
+        end)
+        if not ok2 then visivel = nil end
+    end
+
+    -- [SEGUNDO RAY -- A ZONA] A zona saiu do filtro do raio de luz; aqui
+    -- ela INCLUI: se o segmento toca a pasta restricted/, o tiro e
+    -- proibido ali dentro. Fato separado da luz -- a mira precisa dos dois,
+    -- e fundir os dois num booleano so foi o defeito que o 7v7 pagou caro
+    -- para descobrir. Zona sem CanQuery responde nil (harmless: zona
+    -- bloqueada = false).
+    local zonaBloq = false
+    if OTIM.wallZona then
+        local z = zonaCessarFogo()
+        if z then
+            pcall(function()
+                local pz = RaycastParams.new()
+                pz.FilterType = Enum.RaycastFilterType.Include
+                pz.FilterDescendantsInstances = { z }
+                pz.IgnoreWater = true
+                zonaBloq = Workspace.Raycast(Workspace, origem, delta, pz) ~= nil
+            end)
+        end
+    end
+
+    -- [GRAVA NO CACHE] com o balde de origem -- andar menos que o quantum
+    -- nao revalida; andar mais, sim.
+    if cacheParede[model] == nil then
+        nCacheParede = nCacheParede + 1
+        if nCacheParede > TETO_PAREDE then
+            cacheParede = setmetatable({}, { __mode = "k" })
+            nCacheParede = 0
+        end
+    end
+    cacheParede[model] = { visivel = visivel, zona = zonaBloq,
+                           quando = agoraW, bx = bx, by = by, bz = bz }
+    return visivel, zonaBloq
 end
 
 -- =====================================================================
@@ -3214,7 +3586,7 @@ local FONTE_TC = [====[
 --[[ ==========================================================================
      TEAM CHECK POR ZONA RESTRITA
 
-     MARCA: TC-ZONA-2026-10-23-J
+     MARCA: TC-ZONA-2026-10-23-M
 
      [A REGRA, NAS PALAVRAS DO DONO]
 
@@ -3282,7 +3654,7 @@ local FONTE_TC = [====[
      [READ-ONLY] Le' Workspace. Nao escreve, nao desenha, nao imprime.
      ========================================================================== ]]
 
-local MARCA = "TC-ZONA-2026-10-23-J"
+local MARCA = "TC-ZONA-2026-10-23-M"
 
 -- ==========================================================================
 --  CONFIG
@@ -3909,6 +4281,10 @@ local tcVivoUlt = nil
 --   frenteFora  = a rede do plano da raiz reprou
 local cVivos, cTroncoFora, cOssoFora, cFrenteFora = 0, 0, 0, 0
 local cNickAliado = 0
+-- [PAREDE] alvos que o veredito de parede marcou `dead` neste pacote
+-- (coberto OU zona de cessar-fogo). Vai no dump: se a mira parar de
+-- travar, este numero diz se o wall check e o autor.
+local wBloqParede = 0
 local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, camera)
     -- [ABA CONFIG] Rela os flags do painel no maximo 1x a cada 2 s (ver
     -- OTIM.RECARGA). Sem isto, mexer num switch do overlay so' teria
@@ -3960,9 +4336,12 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
     -- comeca em branco pra nao casar aliado antigo duas vezes.
     for nomeCorpo, info in pairs(MCorpo) do
         if (agora - info.em) > 3 then MCorpo[nomeCorpo] = nil end
+        -- o corpo que virou aliado travado nao precisa mais de codinome
+        if MALIADOS_CORPO[nomeCorpo] then MPIN[nomeCorpo] = nil end
     end
 
     tcFiltrados = 0
+    wBloqParede = 0
     local targets = {}
     local sig = {csig}
     local nS = 1
@@ -4073,20 +4452,48 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
                 cFrenteFora = cFrenteFora + 1
                 continue
             end
-            -- [A PONTE NICK -- O QUADRADO DO JOGO]
+            -- [A PONTE NICK -- O QUADRADO DO JOGO, COM A REGRA DE 1 VEZ]
             --
-            -- O quadradinho + nick (PlayerGui, ScreenGui dos marcadores)
-            -- so' existe sobre ALIADOS -- palavras do dono. O corpo cuja
-            -- raiz projeta dentro da janela de um quadradinho VISIVEL
-            -- (70x100 px) e' aquele jogador: nick real + aliado confirmado
-            -- PELO PROPRIO JOGO. Aliado = escondido, independente da zona.
-            -- O nick fica guardado por 3 s (MCorpo) para os pacotes em que
-            -- o marcador leu de uma posicao e o corpo projetou noutra.
-            local nickAqui = casaNick(v.modelName,
-                partesDoAlvo and (partesDoAlvo["humanoid_root_part"]
-                    or partesDoAlvo["torso"] or partesDoAlvo["head"]),
-                camera, agora)
+            -- Casou o quadradinho VISIVEL (70x100 px) com a projecao do
+            -- corpo -> nick real + candidato a aliado confirmado. O DONO
+            -- pediu: confirmado 1 vez pelo quadradinho, esse player NUNCA
+            -- mais aparece no ESP ate o fim da partida. Confirmacao = o
+            -- MESMO corpo casar o MESMO nick em 2 pacotes SEGUIDOS (um
+            -- casamento de frame ruim nao trava inimigo que passou perto
+            -- do marcador de um aliado: a sequencia quebra sem casar).
+            -- Travado por nick E por corpo: o nick cobre respawn (novo id
+            -- de corpo ja' nasce escondido), o corpo cobre o quadradinho
+            -- que o jogo esconde (fumaca/parede) sem reabrir o ESP.
+            local nomeCorpo = v.modelName
+            local nickAqui = nil
+            local jaTravado = MALIADOS_CORPO[nomeCorpo] or nil
+            local partesRaiz = partesDoAlvo and (partesDoAlvo["humanoid_root_part"]
+                or partesDoAlvo["torso"] or partesDoAlvo["head"])
+            nickAqui = casaNick(nomeCorpo, partesRaiz, camera, agora)
             if nickAqui then
+                MALRUA[nomeCorpo] = (MALRUA[nomeCorpo] or 0) + 1
+                if MALRUA[nomeCorpo] >= 2 then
+                    if not MALIADOS_NICK[nickAqui] then
+                        MALIADOS_NICK[nickAqui] = true
+                        MLockN = MLockN + 1
+                        -- [O PIN SOLTO] se algum corpo estava usando esse
+                        -- nick como CODINOME de inimigo, solta: no proximo
+                        -- pacote ele re-pin com o pool corrigido (sem esse
+                        -- nick, que agora e' comprovadamente de aliado)
+                        for corpoPin, nickPin in pairs(MPIN) do
+                            if nickPin == nickAqui then MPIN[corpoPin] = nil end
+                        end
+                    end
+                    if not MALIADOS_CORPO[nomeCorpo] then
+                        MALIADOS_CORPO[nomeCorpo] = true
+                        MLockC = MLockC + 1
+                    end
+                end
+            else
+                MALRUA[nomeCorpo] = nil
+            end
+            if jaTravado
+               or (nickAqui and MALIADOS_NICK[nickAqui]) then
                 cNickAliado = cNickAliado + 1
                 continue
             end
@@ -4155,22 +4562,44 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
             -- ficar sem o nome do alvo para sempre.
             local cab = cabecalhoDe(v, agora)
             local visDesteAlvo = nil
+            local zonaDesteAlvo = nil
             if OTIM.vis then
-                visDesteAlvo = visivelDaCamera(cam, v.model, v.data.parts,
-                                               player.Character)
+                visDesteAlvo, zonaDesteAlvo =
+                    paredeVeredito(cam, v.model, v.data.parts)
             end
+            -- ==========================================================
+            -- [PAREDE -> dead -- A UNICA ROTA QUE CHEGA NA MIRA]
+            -- ==========================================================
+            -- O campo `vis` abaixo segue no pacote e o servidor o DESCARTA
+            -- (a tupla tem 9 campos; vis e o 10o). O `dead` e quem chega:
+            -- overlay.py:1036 faz `if dead: continue` na MIRA e o ESP
+            -- ignora dead (2514/2555) -- pelo coberto continua desenhado,
+            -- e o aim nao trava nele. "So wall check no aimbot".
+            --
+            -- [SOMENTE VEREDITO MEDIDO BLOQUEIA] `false` medido entra no
+            -- OR; `nil` (nao medido: sem raycast, API estourou) NAO entra
+            -- -- o `~= true` do 7v7 transformava nao-medido em morto e a
+            -- mira ficava cega para todo mundo. Zona de cessar-fogo no
+            -- caminho tambem marca (o tiro e proibido ali dentro).
+            local deadParede = false
+            if OTIM.vis then
+                if visDesteAlvo == false then deadParede = true end
+                if OTIM.wallViaDead and zonaDesteAlvo == true
+                    then deadParede = true end
+            end
+            if deadParede then wBloqParede = wBloqParede + 1 end
             local alvo = {
                 id = cab.id,
                 hp = v.health,
                 maxHp = v.maxHealth,
-                dead = v.deadNow and true or false,
-                -- [PAREDE] nil quando o switch esta' desligado ou o
-                -- executor nao tem Raycast: o receptor trata nil como
-                -- "visivel", entao o comportamento antigo e' preservado.
-                -- NAO pode ser `OTIM.vis and f(...) or nil`: um alvo
-                -- COBERTO devolve `false`, e o `or nil` transformaria
-                -- justamente ele em "sem informacao" -- ou seja, o
-                -- wall-check nunca barraria ninguem.
+                dead = (v.deadNow and true) or deadParede,
+                -- [PAREDE] fica nil quando o switch esta desligado ou o
+                -- executor nao tem Raycast. O receptor tracado de antes
+                -- (tratar nil como visivel) continua valendo: nil nunca
+                -- entra no OR do dead acima. NAO pode ser
+                -- `OTIM.vis and f(...) or nil`: alvo COBERTO devolve
+                -- `false`, e `or nil` transformaria justamente ele em
+                -- "sem informacao".
                 vis = visDesteAlvo,
                 -- [BUG: `parts` E' O ALVO INTEIRO, NAO A LISTA DE PARTES]
                 --
@@ -4270,7 +4699,11 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
             if nickFresco and (agora - nickFresco.em) < 3 then
                 alvo.display = nickFresco.nick
             else
-                alvo.display = v.display
+                -- [O CODINOME DO INIMIGO] nick do PLACAR real (pool = roster
+                -- - eu - aliados travados - ja' pinados), pinoado UMA vez e
+                -- estavel ate o fim da partida. Se o placar nao estiver
+                -- legivel, cai no ID do corpo como sempre foi.
+                alvo.display = pinInimigo(v.modelName, agora) or v.display
             end
             alvo.team = v.team
             local nUse = nPartes or 0
@@ -4281,8 +4714,15 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
                 sig[nS] = tsig[i2]
             end
             nS = nS + 1
+            -- [PAREDE NA ASSINATURA] O veredito tem de estar aqui: com
+            -- todo mundo PARADO (eu parado, alvo parado, parede parada)
+            -- o pacote inteiro e identico e o portao la no sendBridge
+            -- o segura. A virada de parede (alvo saiu de atras da
+            -- cobertura, ou entrou) teria de esperar OTRA mudanca
+            -- qualquer. Com o token, o flip passa na hora.
             sig[nS] = v.modelName .. "|" .. tostring(v.health) .. "|"
                     .. tostring(v.maxHealth) .. "|" .. (v.deadNow and "1" or "0")
+                    .. (deadParede and "P" or "-")
                     .. tostring(nUse)
             if not eOrcamento and nPartes and nPartes > 0 then
                 -- A parte 1 e' arbitraria (pairs nao garante ordem), mas
@@ -4508,6 +4948,13 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
                 .. " mem=" .. memTxt
                 .. " nick=" .. tostring(cNickAliado)
                 .. " marc=" .. tostring(MLote and #MLote or -1)
+                .. " mlok=" .. tostring(MLockN) .. "/" .. tostring(MLockC)
+                .. " pin=" .. (function()
+                    local nPin = 0
+                    for _ in pairs(MPIN) do nPin = nPin + 1 end
+                    return tostring(nPin)
+                end)()
+                .. " wall=" .. tostring(wBloqParede)
                 .. " diag=" .. tostring(diagUltimo)
                 .. " tcErro=" .. tostring(TC_ERRO))
         end)
@@ -4551,119 +4998,3 @@ local myKeysCache, myKeysAt = nil, 0
 --
 --      1533  BindToRenderStep(ESP_RENDER_NAME, ...)     <- registra o NOVO
 --      1614  cleanup()  -> UnbindFromRenderStep(...)    <- DESREGISTRA o NOVO
---
---   Resultado: o loop nascia morto. O sintoma era `bridgeFailReason` parado
---   em "nunca tentou" (o valor inicial) e `received` nunca subindo, sem
---   NENHUM erro em lugar nenhum -- porque nao havia erro: o callback
---   simplesmente nunca era chamado.
---
---   Medido no Roblox: com o mesmo nome e a mesma prioridade, um loop
---   registrado a mao dispara ~432 vezes em 3 s; o loop do script disparava 0.
---   Depois de um Unbind do nome, o contador para (delta 0) e o outro loop
---   (nome diferente) continua -- confirmando que o Unbind e' por nome.
---
--- Agora o registro acontece DEPOIS do cleanup, no fim do arquivo.
-local function iniciarLoop()
-    RunService:BindToRenderStep(ESP_RENDER_NAME, Enum.RenderPriority.Camera.Value + 1, function()
-
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-
-    -- A parte do corpo escolhida no painel do Windows. O Lua nao usa isto
-    -- para mirar (quem mira e' o overlay); serve para manter o canal vivo.
-    local now = os.clock()
-
-    -- [DIAGNOSTICO] Escreve o estado atual, no maximo 1x por segundo. Fica
-    -- ANTES de qualquer `return` deste bloco de proposito: se o coletor
-    -- estiver parando no `if not cam` ou no `if not camData`, o arquivo
-    -- precisa existir mesmo assim para dizer isso.
-
-    if now >= nextAimPartAt then
-        nextAimPartAt = now + 1.0
-        pollAimPart()
-    end
-
-    -- Placar e killfeed tem cache proprio (0,5 s). Sem esta chamada as
-    -- etiquetas de time nunca seriam lidas: o getEntityKeys so' consulta
-    -- as tabelas, nao as atualiza.
-    refreshSocialCaches()
-
-    local camData = cameraData(cam)
-
-    if not camData then return end
-
-    -- Chaves do jogador local, para o overlay comparar.
-    if not myKeysCache or now - myKeysAt > 1.0 then
-        myKeysCache = keysToArray(getMyKeys())
-        myKeysAt = now
-    end
-
-    -- [A CHAMADA QUE FALTAVA -- O BUG QUE DEIXAVA O COLETOR MUDO]
-    --
-    -- `sendBridge` (secao 3) espera uma FUNCAO, nao uma tabela:
-    --
-    --     sendBridge(function() return body, assinatura end)
-    --
-    -- A secao 9 montava a tabela do pacote INLINE (um `for` sobre `tracked`
-    -- chamando `buildTarget`) e passava essa TABELA direto. O `pcall(build)`
-    -- la' dentro levantava "attempt to call a table value" -- medido 1374
-    -- vezes em 10 s -- e o coletor ficava MUDO: `bridgeSent` em 0, o servidor
-    -- sem receber nada, e nenhum erro visivel fora do campo `bridgeBuildErr`,
-    -- que so' o painel mostrava.
-    --
-    -- O `buildPacket` (secao 8, linha 1380) JA' fazia as duas coisas: monta
-    -- o pacote (com `listaViva` + `buildTarget` por alvo) e calcula a
-    -- assinatura, devolvendo `return packet, table.concat(sig, "\1")` na
-    -- linha 1521. Ele NUNCA era chamado -- o loop reimplementava a montagem
-    -- inline, e essa reimplementacao nao produzia assinatura nenhuma.
-    --
-    -- [POR QUE A ASSINATURA IMPORTA] E' o portao que mais economiza: jogador
-    -- parado com a camera parada gera assinatura identica, o `sendBridge`
-    -- devolve cedo e o JSONEncode nem e' pago. Sem ela, cada um dos 60-240
-    -- quadros/s pagaria encode + POST para reenviar o mesmo estado.
-    -- [ASSINATURA REAL DO buildPacket]
-    --     buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, camera)
-    -- Dos SETE parametros, o corpo usa apenas QUATRO: `camData` (camera),
-    -- `myKeys` (chaves de time, viram `myTeam` no pacote), `agora` (relogio
-    -- para o cache do placar) e `camera` (a INSTANCIA, para o filtro "basta
-    -- um osso"). `myIds`, `myFlat` e `myKeysInfo` sao vestigios
-    -- da versao anterior do coletor e nao sao lidos em lugar nenhum do corpo
-    -- -- passamos valores vazios para manter a aridade e nao mexer na
-    -- assinatura da funcao.
-    sendBridge(function()
-        return buildPacket(camData, {}, {}, myKeysCache, os.clock(), nil, cam)
-    end)
-    end)
-end
-
--- =====================================================================
--- 10. LIMPEZA
--- =====================================================================
--- Sem ScreenGui nao ha' Destroying para escutar. O executor reinjeta o
--- script a cada sessao; a limpeza acontece quando o Roblox fecha ou
--- quando este script e' reexecutado.
-local function cleanup()
-    -- [SO' O PROPRIO NOME] era UnbindFromRenderStep(ESP_RENDER_NAME), que
-    -- com nome constante derrubava o bind da execucao NOVA.
-    pcall(function() RunService:UnbindFromRenderStep(_NOME_BIND) end)
-    for model in pairs(tracked) do removeModel(model) end
-    for _, c in ipairs(connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    table.clear(connections)
-end
-
--- Registra o stop para o caso de reexecucao (evita dois loops ativos).
-local globals = (type(getgenv) == "function" and getgenv()) or _G
-local REGISTRY = "__MATRIX_PURE_COLLECTOR"
-if type(globals[REGISTRY]) == "table" and type(globals[REGISTRY].stop) == "function" then
-    pcall(globals[REGISTRY].stop)
-end
-
--- [A ORDEM CERTA] `cleanup()` acima ja' desregistrou o loop da execucao
--- anterior -- se houvesse um. SO' AGORA registramos o loop desta execucao.
--- Antes o BindToRenderStep vinha na secao 9 e o cleanup logo depois o
--- apagava, deixando o coletor mudo sem nunca emitir erro.
-iniciarLoop()
-
-globals[REGISTRY] = {stop = cleanup}
