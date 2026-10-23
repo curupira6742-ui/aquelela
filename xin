@@ -1920,6 +1920,210 @@ local ALIASES_OSSO = {
 local diagUltimo = nil
 local diagEm = 0
 
+-- =====================================================================
+-- [A PONTE NICK -- O QUADRADO DO JOGO DIZ QUEM E' ALIADO]
+--
+-- MEDIDO (sondas MARCADOR 1/3, 20:0x): o jogo mantem um ScreenGui em
+-- PlayerGui com UM Frame POR ALIADO:
+--
+--   Frame '<NICK>'                 (nome do frame = NICK REAL)
+--     Frame     '1'  4x4px BRANCO  -> o quadradinho no meio do corpo
+--     TextLabel '2'  pos 0,14px     -> o nick LOGO ABAIXO
+--
+-- Aliados fora da vista ficam vis=False e parkados em pos 0,0 scale(10,10).
+-- O placar ({1814FF63}) confirma: 15 jogadores, times COMPLEX/SYNO.
+-- O corpo (Workspace/characters/<numerico>) NAO carrega id/nick/owner
+-- nenhum (medido: so' mesh_id de malha) e Player.Character e' nil --
+-- entao o vinculo corpo->nick e' por PROJECAO: o quadradinho esta na
+-- tela onde o corpo esta projetado. Radius de casamento: 70x100 px,
+-- centro do corpo (raiz) contra centro do quadradinho.
+--
+-- Contrato com o dono: "o jogo coloca um quadrado bem pequeno no meio de
+-- cada aliado e o nick dele embaixo do quadrado" -> marcador = ALIADO.
+-- =====================================================================
+local MGui = nil      -- {sg=ScreenGui, marcos={Frame...}}
+local MGuiEm = 0      -- ultima busca da GUI (rate 3 s)
+local MLote = nil     -- lista {nick=,x=,y=} dos marcadores VISIVEIS agora
+local MLoteEm = 0     -- ultima leitura do lote (rate 0.5 s)
+local MCorpo = {}     -- [nomeCorpo] = {nick="...", em=os.clock()}
+local MCont = 0       -- total de casamentos (diagnose)
+
+local function achaMarcadores(agora)
+    -- [REVALIDACAO BARATA] se a GUI morreu (rematch), o Parent some
+    if MGui then
+        local vivo = false
+        pcall(function()
+            vivo = MGui.sg and MGui.sg.Parent and MGui.sg.Enabled and true or false
+        end)
+        if vivo and (agora - MGuiEm) < 3 then return MGui end
+        MGui = nil
+    else
+        if (agora - MGuiEm) < 3 then return nil end
+    end
+    MGuiEm = agora
+    if not Players then return nil end
+    local ok, pg = pcall(function()
+        local pl = Players.LocalPlayer
+        return pl and pl:FindFirstChild("PlayerGui") or nil
+    end)
+    if not ok or not pg then return nil end
+    -- [O TESTE DEFINITIVO] a GUI certa tem 4+ frames com TAMBEM o texto
+    -- do label IGUAL ao nome do frame (medido nos 8: nome==nick). O painel
+    -- de fps e o tutorial tem no maximo 2 e texto diferente do nome.
+    local melhorN = 0
+    local melhorSg = nil
+    local melhorMarcos = nil
+    pcall(function()
+        for _, sg in ipairs(pg:GetChildren()) do
+            if sg:IsA("ScreenGui") and sg.Enabled then
+                local marcos, n = {}, 0
+                for _, d in ipairs(sg:GetDescendants()) do
+                    if d:IsA("Frame") then
+                        local quad, nick = false, false
+                        pcall(function()
+                            for _, sub in ipairs(d:GetChildren()) do
+                                if sub:IsA("Frame") then
+                                    local s = sub.Size
+                                    if s.X.Offset >= 2 and s.X.Offset <= 20
+                                       and s.Y.Offset >= 2 and s.Y.Offset <= 20 then
+                                        quad = true
+                                    end
+                                elseif sub:IsA("TextLabel") then
+                                    if #sub.Text > 0
+                                       and tostring(sub.Text) == tostring(d.Name) then
+                                        nick = true
+                                    end
+                                end
+                            end
+                        end)
+                        if quad and nick then
+                            n = n + 1
+                            marcos[n] = d
+                        end
+                    end
+                end
+                if n > melhorN then
+                    melhorN = n
+                    melhorSg = sg
+                    melhorMarcos = marcos
+                end
+            end
+        end
+    end)
+    if melhorSg and melhorN >= 4 then
+        MGui = { sg = melhorSg, marcos = melhorMarcos }
+        return MGui
+    end
+    return nil
+end
+
+local function leMarcadores(agora)
+    -- o lote e fresco? (0,5 s e a GUI dos marcadores nao e' barata de varrer
+    -- com GetDescendants -- o teste e' so' nos 8 frames guardados)
+    if MLote and (agora - MLoteEm) < 0.5 then return MLote end
+    MLoteEm = agora
+    local gui = achaMarcadores(agora)
+    if not gui then
+        MLote = nil
+        return nil
+    end
+    local lote, n = {}, 0
+    -- o inset da barra de titulo: AbsolutePosition mora no espaco DE GUI,
+    -- WorldToViewportPoint no espaco DO VIEWPORT. Com IgnoreGuiInset=false
+    -- (padrao) a GUI comeca DEPOIS do topo -- somar o inset pra casar.
+    local insetX, insetY = 0, 0
+    pcall(function()
+        local gs = game:GetService("GuiService")
+        local inset = gs and gs:GetGuiInset()
+        if inset then
+            insetX = math.floor(inset.X + .5)
+            insetY = math.floor(inset.Y + .5)
+        end
+    end)
+    local ignoraInset = false
+    pcall(function() ignoraInset = gui.sg.IgnoreGuiInset end)
+    if ignoraInset then insetX, insetY = 0, 0 end
+    pcall(function()
+        for _, m in ipairs(gui.marcos) do
+            local vis = false
+            pcall(function() vis = m.Visible end)
+            if vis then
+                local nick = tostring(m.Name)
+                pcall(function()
+                    for _, sub in ipairs(m:GetChildren()) do
+                        if sub:IsA("TextLabel") and #sub.Text > 0 then
+                            nick = tostring(sub.Text)
+                            break
+                        end
+                    end
+                end)
+                local aX, aY = nil, nil
+                pcall(function()
+                    local ap = m.AbsolutePosition
+                    local as = m.AbsoluteSize
+                    aX = ap.X + as.X * 0.5
+                    aY = ap.Y + as.Y * 0.5
+                end)
+                if aX then
+                    n = n + 1
+                    lote[n] = {
+                        nick = nick,
+                        x = math.floor(aX - insetX + .5),
+                        y = math.floor(aY - insetY + .5),
+                    }
+                end
+            end
+        end
+    end)
+    MLote = lote
+    return MLote
+end
+
+-- [O CASAMENTO] centro projetado da raiz do corpo x centro do quadradinho.
+-- Devolve o NICK do aliado ou nil. Guarda no MCorpo com validade de 3 s.
+local function casaNick(modelNome, raiz, camera, agora)
+    local guardado = MCorpo[modelNome]
+    if guardado and (agora - guardado.em) < 3 then return guardado.nick end
+    if not raiz or not camera then return nil end
+    local lote = leMarcadores(agora)
+    if not lote or #lote == 0 then return nil end
+    local posR = raiz.Position
+    local okP, res = pcall(function()
+        return camera:WorldToViewportPoint(
+            Vector3.new(posR.X, posR.Y, posR.Z))
+    end)
+    if not okP or not res then return nil end
+    -- [XENO] o WorldToViewportPoint devolve S O Vector3 (sem onScreen):
+    -- o pcall acima colapsa multi-retorno no PRIMEIRO valor, que  o
+    -- Vector3 -- e o caso Roblox-padro tambm vem como Vector3 aqui.
+    if type(res) ~= "table" or not res.X then return nil end
+    local vx, vy, vz = res.X, res.Y, res.Z
+    if not vx or not vy then return nil end
+    if vz and vz <= 0 then return nil end -- atras da camera: nenhum marker
+    local melhorNick, melhorD = nil, nil
+    for _, m in ipairs(lote) do
+        if m.x and m.y then
+            local dx = m.x - vx
+            -- o nick fica 14px ABAIXO do quadradinho: o centro do CORPO na
+            -- tela cai entre os dois; janela vertical folgada (100 px)
+            local dy = m.y - vy
+            if math.abs(dx) <= 70 and math.abs(dy) <= 100 then
+                local d2 = dx * dx + dy * dy
+                if not melhorD or d2 < melhorD then
+                    melhorD = d2
+                    melhorNick = m.nick
+                end
+            end
+        end
+    end
+    if melhorNick then
+        MCorpo[modelNome] = { nick = melhorNick, em = agora }
+        MCont = MCont + 1
+        return melhorNick
+    end
+    return nil
+end
+
 local function buildTarget(v, slot, agoraPacote)
     local model = v.model
     local parts = v.data.parts
@@ -1967,6 +2171,14 @@ local function buildTarget(v, slot, agoraPacote)
         --
         -- Agora a saida vai para `listaPartes`, uma tabela nova por chamada.
         for name, part in pairs(parts) do
+            -- [HITBOX FORA DA CAIXA -- O CONSERTO DA CAIXA GRANDE]
+            -- Medido no pacote: hitbox = 6.0x7.71x4.92 (maior que o corpo:
+            -- cabeca 1x1x1, torso 2x2x1, bracos 0.85x2x0.85). A caixa do
+            -- overlay e' a UNIAO de todas as partes -- com o hitbox ela
+            -- vira 6x7.7 e chega a dobrar o visual de perto. A caixa certa
+            -- e' a do CORPO: as partes vis, que sao as unicas RENDERIZADAS
+            -- pelo jogo. O hitbox nao alimenta caixa, esqueleto nem mira.
+            if name == "hitbox" then continue end
             -- [BUG CORRIGIDO -- SEGUNDA METADE DO MESMO DEFEITO]
             --
             -- Era `if part.Parent == model then`, que exige a parte como filho
@@ -3002,7 +3214,7 @@ local FONTE_TC = [====[
 --[[ ==========================================================================
      TEAM CHECK POR ZONA RESTRITA
 
-     MARCA: TC-ZONA-2026-10-23-H
+     MARCA: TC-ZONA-2026-10-23-J
 
      [A REGRA, NAS PALAVRAS DO DONO]
 
@@ -3070,7 +3282,7 @@ local FONTE_TC = [====[
      [READ-ONLY] Le' Workspace. Nao escreve, nao desenha, nao imprime.
      ========================================================================== ]]
 
-local MARCA = "TC-ZONA-2026-10-23-H"
+local MARCA = "TC-ZONA-2026-10-23-J"
 
 -- ==========================================================================
 --  CONFIG
@@ -3696,6 +3908,7 @@ local tcVivoUlt = nil
 --   ossoFora    = "nenhum osso projeta" reprou todos
 --   frenteFora  = a rede do plano da raiz reprou
 local cVivos, cTroncoFora, cOssoFora, cFrenteFora = 0, 0, 0, 0
+local cNickAliado = 0
 local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, camera)
     -- [ABA CONFIG] Rela os flags do painel no maximo 1x a cada 2 s (ver
     -- OTIM.RECARGA). Sem isto, mexer num switch do overlay so' teria
@@ -3741,6 +3954,13 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
     cTroncoFora = 0
     cOssoFora = 0
     cFrenteFora = 0
+    cNickAliado = 0
+    -- [O ALTAR DE COMBATE] os casamentos do pacote anterior viraram NICK
+    -- fresco (validade 3 s no MCorpo); a janela de casamento deste pacote
+    -- comeca em branco pra nao casar aliado antigo duas vezes.
+    for nomeCorpo, info in pairs(MCorpo) do
+        if (agora - info.em) > 3 then MCorpo[nomeCorpo] = nil end
+    end
 
     tcFiltrados = 0
     local targets = {}
@@ -3851,6 +4071,23 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
             end
             if not naFrenteDaCamera(posV, cam, look) then
                 cFrenteFora = cFrenteFora + 1
+                continue
+            end
+            -- [A PONTE NICK -- O QUADRADO DO JOGO]
+            --
+            -- O quadradinho + nick (PlayerGui, ScreenGui dos marcadores)
+            -- so' existe sobre ALIADOS -- palavras do dono. O corpo cuja
+            -- raiz projeta dentro da janela de um quadradinho VISIVEL
+            -- (70x100 px) e' aquele jogador: nick real + aliado confirmado
+            -- PELO PROPRIO JOGO. Aliado = escondido, independente da zona.
+            -- O nick fica guardado por 3 s (MCorpo) para os pacotes em que
+            -- o marcador leu de uma posicao e o corpo projetou noutra.
+            local nickAqui = casaNick(v.modelName,
+                partesDoAlvo and (partesDoAlvo["humanoid_root_part"]
+                    or partesDoAlvo["torso"] or partesDoAlvo["head"]),
+                camera, agora)
+            if nickAqui then
+                cNickAliado = cNickAliado + 1
                 continue
             end
             -- [TEAM CHECK POR ZONA RESTRITA -- ATIVO]
@@ -4019,9 +4256,22 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
             --
             -- Economizar bytes que o consumidor nao sabe reconstruir nao e'
             -- otimizacao: e' perder dado.
+            -- [SAO JOGADORES -- PALAVRA DO DONO]
+            -- Os corpos deste jogo sao 15 jogadores reais (placar medido:
+            -- 14 nomes + o dono). O `v.data.owner` e' SEMPRE nil aqui
+            -- (GetPlayerFromCharacter falha: os corpos nao sao
+            -- Player.Character) e o kind antigo caia em 'npc' -- o overlay
+            -- mostrava 'npc' e o nick vira o ID numerico. kind pasa a ser
+            -- 'player' SEMPRE; o display, o nick real quando o quadradinho
+            -- casou, e o ID do corpo quando nao (melhor do que nada).
             alvo.model = v.modelName
-            alvo.kind = v.data.owner and "player" or "npc"
-            alvo.display = v.display
+            alvo.kind = "player"
+            local nickFresco = MCorpo[v.modelName]
+            if nickFresco and (agora - nickFresco.em) < 3 then
+                alvo.display = nickFresco.nick
+            else
+                alvo.display = v.display
+            end
             alvo.team = v.team
             local nUse = nPartes or 0
             local eOrcamento = #targets <= MAX_SIG_PARTS
@@ -4209,6 +4459,28 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
                 end
             end
 
+            -- [A MEMORIA DO TC NO DUMP] quem esta' travado e de que lado:
+            -- mem=NOME:1(aliado)/0(inimigo)/-(pendente limitado a 12). E'
+            -- o que decide se um "aliado desenhado" e' pendente ou foi
+            -- travado no lado errado.
+            local memTxt = ""
+            if TC and type(TC.memoria) == "function" then
+                local okM, mem = pcall(TC.memoria)
+                if okM and type(mem) == "table" then
+                    local nM = 0
+                    for _, m in ipairs(mem) do
+                        if nM >= 12 then break end
+                        nM = nM + 1
+                        local nm = tostring(m.nome or "?")
+                        if #nm > 8 then nm = string.sub(nm, 1, 8) end
+                        local lado = "-"
+                        if m.aliado == true then lado = "1"
+                        elseif m.aliado == false then lado = "0" end
+                        memTxt = memTxt .. nm .. ":" .. lado .. " "
+                    end
+                end
+            end
+
             writefile("coletor_tc_vivo.txt",
                 "t=" .. os.time()
                 .. " alvos=" .. #targets
@@ -4233,6 +4505,10 @@ local function buildPacket(camData, myIds, myFlat, myKeys, agora, myKeysInfo, ca
                     (est.meuPos and est.meuPos[2]) or 0,
                     (est.meuPos and est.meuPos[3]) or 0)
                 .. " zL=" .. lista
+                .. " mem=" .. memTxt
+                .. " nick=" .. tostring(cNickAliado)
+                .. " marc=" .. tostring(MLote and #MLote or -1)
+                .. " diag=" .. tostring(diagUltimo)
                 .. " tcErro=" .. tostring(TC_ERRO))
         end)
     end
